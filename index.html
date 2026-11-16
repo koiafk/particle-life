@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<title>particle life</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body {
+  width: 100%; height: 100%;
+  overflow: hidden; background: #000;
+  touch-action: none; user-select: none; -webkit-user-select: none;
+}
+canvas { display: block; position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
+#ui {
+  position: absolute; inset: 0; pointer-events: none;
+  transition: opacity 0.4s ease; opacity: 1;
+}
+#ui.idle { opacity: 0.3; }
+#ui.hidden { display: none; }
+.matrix-wrap {
+  position: absolute; left: 14px; bottom: 14px;
+  display: grid; grid-template-columns: repeat(6, 18px); gap: 2px;
+  background: rgba(10, 10, 10, 0.75); padding: 5px;
+  border: 1px solid #1f1f1f; border-radius: 2px; pointer-events: auto;
+}
+.m-cell {
+  width: 18px; height: 18px;
+  border: 1px solid #161616; border-radius: 1px;
+  cursor: pointer;
+}
+.controls {
+  position: absolute; right: 14px; bottom: 14px;
+  display: flex; gap: 5px; pointer-events: auto;
+}
+.btn {
+  font-family: monospace, sans-serif; font-size: 11px;
+  color: #777; background: rgba(12, 12, 12, 0.8);
+  border: 1px solid #242424; border-radius: 2px;
+  padding: 5px 9px; cursor: pointer; text-transform: lowercase; outline: none;
+}
+.btn:hover { color: #bbb; border-color: #444; }
+.btn:active { background: #1c1c1c; }
+@media (max-width: 420px) {
+  .matrix-wrap { left: 8px; bottom: 8px; grid-template-columns: repeat(6, 15px); gap: 1px; padding: 3px; }
+  .m-cell { width: 15px; height: 15px; }
+  .controls { right: 8px; bottom: 8px; gap: 3px; }
+  .btn { font-size: 10px; padding: 4px 6px; }
+}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="ui">
+  <div class="matrix-wrap" id="matrix"></div>
+  <div class="controls">
+    <button class="btn" id="btn-rand">randomize</button>
+    <button class="btn" id="btn-reset">reset</button>
+    <button class="btn" id="btn-link">link</button>
+  </div>
+</div>
+<script>
+const N_INIT = 1000;
+const RMAX = 80;
+const BETA = 0.3;
+const DAMPING = 0.85;
+const MAX_SPEED = 6.0;
+const FORCE_SCALE = 0.6;
+const TRAIL_ALPHA = 0.07;
+const PARTICLE_RADIUS = 2.0;
+const STIR_RADIUS = 120;
+const STIR_FORCE = 3.5;
+const PALETTE = ['#ff007f', '#00e5ff', '#ffb300', '#39ff14', '#b800ff', '#ff5722'];
+const STEPS = [-1, -0.5, 0, 0.5, 1];
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d', { alpha: false });
+const ui = document.getElementById('ui');
+const matrixEl = document.getElementById('matrix');
+
+let n = N_INIT;
+let w = 0, h = 0, dpr = 1;
+let cols = 0, rows = 0, numCells = 0;
+let paused = false;
+let slowFrames = 0, adapted = false;
+let idleTimer = null;
+let pointerActive = false, px = 0, py = 0;
+let vignette = null;
+
+const x = new Float32Array(n);
+const y = new Float32Array(n);
+const vx = new Float32Array(n);
+const vy = new Float32Array(n);
+const type = new Uint8Array(n);
+const matrix = new Float32Array(36);
+
+let cellCounts = new Int32Array(0);
+let cellStarts = new Int32Array(0);
+let cellOffsets = new Int32Array(0);
+const pIndices = new Int32Array(n);
+
+const DEFAULT_MATRIX = [
+   0.8, -0.3,  0.4, -0.7,  0.2, -0.4,
+  -0.5,  0.9, -0.2,  0.6, -0.5,  0.3,
+   0.4, -0.4,  0.7, -0.3,  0.5, -0.8,
+  -0.7,  0.5, -0.4,  0.8, -0.2,  0.4,
+   0.3, -0.6,  0.2, -0.5,  0.9, -0.3,
+  -0.4,  0.2, -0.8,  0.4, -0.4,  0.7
+];
+
+function cellColor(v) {
+  if (v < 0) {
+    const b = Math.min(255, Math.round(-v * 210) + 45);
+    return 'rgb(12, 35, ' + b + ')';
+  }
+  if (v > 0) {
+    const r = Math.min(255, Math.round(v * 220) + 35);
+    const g = Math.round(v * 125);
+    return 'rgb(' + r + ', ' + g + ', 8)';
+  }
+  return '#111111';
+}
+
+function buildMatrixUI() {
+  matrixEl.innerHTML = '';
+  for (let i = 0; i < 36; i++) {
+    const cell = document.createElement('div');
+    cell.className = 'm-cell';
+    cell.dataset.idx = i;
+    cell.style.background = cellColor(matrix[i]);
+    cell.addEventListener('click', onCellClick);
+    cell.addEventListener('contextmenu', onCellRightClick);
+    matrixEl.appendChild(cell);
+  }
+}
+
+function updateMatrixUI() {
+  const cells = matrixEl.children;
+  for (let i = 0; i < 36; i++) {
+    cells[i].style.background = cellColor(matrix[i]);
+  }
+}
+
+function cycleCell(idx, forward) {
+  const cur = Math.round(matrix[idx] * 10) / 10;
+  let nearest = 0, minDiff = 999;
+  for (let s = 0; s < STEPS.length; s++) {
+    const diff = Math.abs(STEPS[s] - cur);
+    if (diff < minDiff) { minDiff = diff; nearest = s; }
+  }
+  const next = forward ? (nearest + 1) % STEPS.length : (nearest + STEPS.length - 1) % STEPS.length;
+  matrix[idx] = STEPS[next];
+  matrixEl.children[idx].style.background = cellColor(matrix[idx]);
+  syncHash();
+}
+
+function onCellClick(e) {
+  e.preventDefault();
+  const idx = parseInt(this.dataset.idx, 10);
+  cycleCell(idx, !e.shiftKey);
+}
+
+function onCellRightClick(e) {
+  e.preventDefault();
+  const idx = parseInt(this.dataset.idx, 10);
+  cycleCell(idx, false);
+}
+
+function resetParticles() {
+  for (let i = 0; i < n; i++) {
+    x[i] = Math.random() * w;
+    y[i] = Math.random() * h;
+    vx[i] = (Math.random() - 0.5) * 2;
+    vy[i] = (Math.random() - 0.5) * 2;
+    type[i] = Math.floor(Math.random() * 6);
+  }
+}
+
+function randomizeMatrix() {
+  for (let i = 0; i < 36; i++) {
+    matrix[i] = STEPS[Math.floor(Math.random() * STEPS.length)];
+  }
+  updateMatrixUI();
+  syncHash();
+}
+
+function clearMatrix() {
+  matrix.fill(0);
+  updateMatrixUI();
+  syncHash();
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = '#000000';
+  ctx.fillRect(0, 0, w, h);
+}
+
+function encodeHash() {
+  const bytes = new Uint8Array(38);
+  bytes[0] = (n >> 8) & 0xff;
+  bytes[1] = n & 0xff;
+  for (let i = 0; i < 36; i++) {
+    const q = Math.max(-10, Math.min(10, Math.round(matrix[i] * 10)));
+    bytes[2 + i] = q + 10;
+  }
+  let bin = '';
+  for (let i = 0; i < 38; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
+}
+
+function decodeHash(str) {
+  try {
+    const bin = atob(str);
+    if (bin.length !== 38) return false;
+    const bytes = new Uint8Array(38);
+    for (let i = 0; i < 38; i++) bytes[i] = bin.charCodeAt(i);
+    const parsedN = (bytes[0] << 8) | bytes[1];
+    if (parsedN >= 100 && parsedN <= 3000) n = parsedN;
+    for (let i = 0; i < 36; i++) {
+      matrix[i] = (bytes[2 + i] - 10) / 10;
+    }
+    return true;
+  } catch (err) {
+    return false;
+  }
+}
+
+function syncHash() {
+  history.replaceState(null, '', '#' + encodeHash());
+}
+
+function resize() {
+  dpr = window.devicePixelRatio || 1;
+  const nw = window.innerWidth;
+  const nh = window.innerHeight;
+  if (w !== nw || h !== nh || canvas.width !== nw * dpr) {
+    if (w > 0 && h > 0) {
+      const sx = nw / w, sy = nh / h;
+      for (let i = 0; i < n; i++) { x[i] *= sx; y[i] *= sy; }
+    }
+    w = nw; h = nh;
+    canvas.width = Math.floor(w * dpr);
+    canvas.height = Math.floor(h * dpr);
+    canvas.style.width = w + 'px';
+    canvas.style.height = h + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    cols = Math.ceil(w / RMAX);
+    rows = Math.ceil(h / RMAX);
+    numCells = cols * rows;
+    if (numCells > cellCounts.length) {
+      cellCounts = new Int32Array(numCells);
+      cellStarts = new Int32Array(numCells + 1);
+      cellOffsets = new Int32Array(numCells);
+    }
+    const rOuter = Math.max(w, h) * 0.75;
+    const rInner = Math.min(w, h) * 0.35;
+    vignette = ctx.createRadialGradient(w * 0.5, h * 0.5, rInner, w * 0.5, h * 0.5, rOuter);
+    vignette.addColorStop(0, 'rgba(0, 0, 0, 0)');
+    vignette.addColorStop(1, 'rgba(0, 0, 0, 0.45)');
+
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.fillStyle = '#000000';
+    ctx.fillRect(0, 0, w, h);
+  }
+}
+
+function pingUI() {
+  ui.classList.remove('idle');
+  clearTimeout(idleTimer);
+  idleTimer = setTimeout(() => ui.classList.add('idle'), 3000);
+}
+
+function updatePhysics() {
+  // Counting-sort particles into spatial hash cells
+  cellCounts.fill(0);
+  for (let i = 0; i < n; i++) {
+    let cx = (x[i] / RMAX) | 0; if (cx < 0) cx = 0; else if (cx >= cols) cx = cols - 1;
+    let cy = (y[i] / RMAX) | 0; if (cy < 0) cy = 0; else if (cy >= rows) cy = rows - 1;
+    cellCounts[cx + cy * cols]++;
+  }
+  cellStarts[0] = 0;
+  for (let c = 0; c < numCells; c++) cellStarts[c + 1] = cellStarts[c] + cellCounts[c];
+  cellOffsets.set(cellStarts.subarray(0, numCells));
+  for (let i = 0; i < n; i++) {
+    let cx = (x[i] / RMAX) | 0; if (cx < 0) cx = 0; else if (cx >= cols) cx = cols - 1;
+    let cy = (y[i] / RMAX) | 0; if (cy < 0) cy = 0; else if (cy >= rows) cy = rows - 1;
+    pIndices[cellOffsets[cx + cy * cols]++] = i;
+  }
+
+  const rmin = BETA * RMAX;
+  const halfW = w * 0.5, halfH = h * 0.5;
+
+  for (let i = 0; i < n; i++) {
+    const xi = x[i], yi = y[i], ti = type[i];
+    let cx = (xi / RMAX) | 0; if (cx < 0) cx = 0; else if (cx >= cols) cx = cols - 1;
+    let cy = (yi / RMAX) | 0; if (cy < 0) cy = 0; else if (cy >= rows) cy = rows - 1;
+
+    let fx = 0, fy = 0;
+    for (let dyCell = -1; dyCell <= 1; dyCell++) {
+      const ncy = (cy + dyCell + rows) % rows;
+      for (let dxCell = -1; dxCell <= 1; dxCell++) {
+        const ncx = (cx + dxCell + cols) % cols;
+        const c = ncx + ncy * cols;
+        const start = cellStarts[c], end = cellStarts[c + 1];
+        for (let idx = start; idx < end; idx++) {
+          const j = pIndices[idx];
+          if (i === j) continue;
+          // Toroidal wrap: minimum image distance on periodic domain
+          let dx = x[j] - xi;
+          if (dx > halfW) dx -= w; else if (dx < -halfW) dx += w;
+          let dy = y[j] - yi;
+          if (dy > halfH) dy -= h; else if (dy < -halfH) dy += h;
+          const d2 = dx * dx + dy * dy;
+          if (d2 > 0 && d2 < RMAX * RMAX) {
+            const d = Math.sqrt(d2);
+            // Short-range repulsion inside beta*rmax, smooth linear falloff beyond
+            let f = (d < rmin) ? (d / rmin - 1) * 2.0 : matrix[ti * 6 + type[j]] * (1.0 - d / RMAX);
+            const invD = 1.0 / d;
+            fx += dx * invD * f;
+            fy += dy * invD * f;
+          }
+        }
+      }
+    }
+
+    if (pointerActive) {
+      let pdx = xi - px;
+      if (pdx > halfW) pdx -= w; else if (pdx < -halfW) pdx += w;
+      let pdy = yi - py;
+      if (pdy > halfH) pdy -= h; else if (pdy < -halfH) pdy += h;
+      const pd2 = pdx * pdx + pdy * pdy;
+      if (pd2 < STIR_RADIUS * STIR_RADIUS && pd2 > 0) {
+        const pd = Math.sqrt(pd2);
+        const ppush = (1.0 - pd / STIR_RADIUS) * STIR_FORCE;
+        fx += (pdx / pd) * ppush;
+        fy += (pdy / pd) * ppush;
+      }
+    }
+
+    vx[i] = (vx[i] + fx * FORCE_SCALE) * DAMPING;
+    vy[i] = (vy[i] + fy * FORCE_SCALE) * DAMPING;
+    const sp2 = vx[i] * vx[i] + vy[i] * vy[i];
+    if (sp2 > MAX_SPEED * MAX_SPEED) {
+      const s = MAX_SPEED / Math.sqrt(sp2);
+      vx[i] *= s; vy[i] *= s;
+    }
+    x[i] = (x[i] + vx[i] + w) % w;
+    y[i] = (y[i] + vy[i] + h) % h;
+  }
+}
+
+function render() {
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = 'rgba(0, 0, 0, ' + TRAIL_ALPHA + ')';
+  ctx.fillRect(0, 0, w, h);
+
+  ctx.globalCompositeOperation = 'lighter';
+  for (let t = 0; t < 6; t++) {
+    ctx.fillStyle = PALETTE[t];
+    ctx.beginPath();
+    for (let i = 0; i < n; i++) {
+      if (type[i] === t) {
+        ctx.moveTo(x[i] + PARTICLE_RADIUS, y[i]);
+        ctx.arc(x[i], y[i], PARTICLE_RADIUS, 0, 6.2831853);
+      }
+    }
+    ctx.fill();
+  }
+
+  if (vignette) {
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.fillStyle = vignette;
+    ctx.fillRect(0, 0, w, h);
+  }
+}
+
+function loop() {
+  if (!document.hidden && !paused) {
+    const t0 = performance.now();
+    updatePhysics();
+    render();
+    const dt = performance.now() - t0;
+    if (dt > 22) {
+      slowFrames++;
+      if (slowFrames >= 30 && !adapted) {
+        adapted = true;
+        n = Math.floor(n * 0.8);
+      }
+    } else {
+      slowFrames = 0;
+    }
+  }
+  requestAnimationFrame(loop);
+}
+
+window.addEventListener('resize', resize);
+window.addEventListener('pointermove', e => {
+  px = e.clientX; py = e.clientY;
+  pingUI();
+});
+window.addEventListener('pointerdown', e => {
+  if (e.target.closest('#ui')) return;
+  pointerActive = true;
+  px = e.clientX; py = e.clientY;
+  pingUI();
+});
+window.addEventListener('pointerup', () => { pointerActive = false; });
+window.addEventListener('pointercancel', () => { pointerActive = false; });
+
+window.addEventListener('keydown', e => {
+  pingUI();
+  if (e.code === 'KeyR') randomizeMatrix();
+  else if (e.code === 'KeyC') clearMatrix();
+  else if (e.code === 'KeyH') ui.classList.toggle('hidden');
+  else if (e.code === 'Space') { e.preventDefault(); paused = !paused; }
+});
+
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && paused) requestAnimationFrame(loop);
+});
+
+document.getElementById('btn-rand').addEventListener('click', randomizeMatrix);
+document.getElementById('btn-reset').addEventListener('click', () => {
+  resetParticles();
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = '#000000';
+  ctx.fillRect(0, 0, w, h);
+});
+document.getElementById('btn-link').addEventListener('click', function() {
+  navigator.clipboard.writeText(location.href);
+  const oldText = this.textContent;
+  this.textContent = 'copied';
+  setTimeout(() => { this.textContent = oldText; }, 1200);
+});
+
+if (location.hash && location.hash.length > 1) {
+  if (!decodeHash(location.hash.slice(1))) matrix.set(DEFAULT_MATRIX);
+} else {
+  matrix.set(DEFAULT_MATRIX);
+}
+
+resize();
+resetParticles();
+buildMatrixUI();
+pingUI();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
